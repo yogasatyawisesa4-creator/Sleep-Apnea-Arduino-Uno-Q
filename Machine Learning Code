@@ -1,0 +1,687 @@
+# SPDX-FileCopyrightText: Copyright (C) ARDUINO SRL (http://www.arduino.cc)
+# SPDX-License-Identifier: MPL-2.0
+from arduino.app_utils import *
+import time
+import numpy as np
+import subprocess
+import python_speech_features
+import joblib
+import os
+import csv
+import json
+import threading
+from datetime import datetime
+
+# ============================================================
+# Coba import Vosk (Keyword Spotting)
+# ============================================================
+try:
+    from vosk import Model as VoskModel, KaldiRecognizer
+    VOSK_AVAILABLE = True
+except ImportError:
+    VOSK_AVAILABLE = False
+    print("[WARN] Vosk tidak tersedia. Keyword spotting dinonaktifkan.")
+
+# ============================================================
+# Coba import requests (untuk Google Spreadsheet push)
+# ============================================================
+try:
+    import requests
+    REQUESTS_AVAILABLE = True
+except ImportError:
+    REQUESTS_AVAILABLE = False
+    print("[WARN] requests tidak tersedia. Spreadsheet push dinonaktifkan.")
+
+# ============================================================
+# PILIH MODEL DI SINI:
+#   0 = SEMUA MODEL (ANN + KNN + SVM jalan bareng, bandingkan)
+#   1 = ANN saja
+#   2 = KNN saja
+#   3 = SVM saja
+# ============================================================
+MODEL_SELECT = 0
+
+# ============================================================
+# Konfigurasi Audio
+# ============================================================
+SAMPLE_RATE    = 16000
+RECORD_SECONDS = 1
+EXPECTED_LEN   = 16000
+
+# ============================================================
+# Konfigurasi Smoothing Window
+# ============================================================
+SMOOTH_WINDOW = 5  # Majority voting dari N detik terakhir
+
+# ============================================================
+# Konfigurasi Apnea State Machine
+# ============================================================
+SNORING_CONFIRM_SEC = 5
+APNEA_MIN_SILENCE   = 10
+APNEA_MAX_SILENCE   = 120
+NOISE_TOLERANCE     = 2
+
+# ============================================================
+# Konfigurasi Vosk
+# ============================================================
+BASE_DIR        = os.path.dirname(os.path.abspath(__file__))
+VOSK_MODEL_PATH = os.path.join(BASE_DIR, "vosk-model-small-en-us-0.15")
+
+# ============================================================
+# Konfigurasi Logging
+# ============================================================
+LOG_DIR = os.path.join(os.path.expanduser("~"), "ArduinoApps", "sleep_logs")
+os.makedirs(LOG_DIR, exist_ok=True)
+
+SPREADSHEET_URL = "https://script.google.com/macros/s/AKfycbwz0QIFCIOjhwpDpm4xmGDuB21YTVg3R5kwY7X9NKNJVpGiXZk8pWHlioLpqdvDmdtS/exec"
+
+
+# ============================================================
+# Load Model ML
+# ============================================================
+def load_single_model(model_id):
+    model_files = {
+        1: ("ann_model.pkl", "ann_scaler.pkl", "ann_pca.pkl", "ANN"),
+        2: ("knn_model.pkl", "knn_scaler.pkl", "knn_pca.pkl", "KNN"),
+        3: ("svm_model.pkl", "svm_scaler.pkl", "svm_pca.pkl", "SVM"),
+    }
+    m_file, s_file, p_file, name = model_files[model_id]
+    models_dir = os.path.join(BASE_DIR, "models")
+    print(f"  Memuat {name} dari {BASE_DIR}...")
+    return {
+        "name":   name,
+        "model":  joblib.load(os.path.join(models_dir, m_file)),
+        "scaler": joblib.load(os.path.join(models_dir, s_file)),
+        "pca":    joblib.load(os.path.join(models_dir, p_file)),
+    }
+
+
+def load_models(mode):
+    if mode == 0:
+        print("[MODE] SEMUA MODEL — ANN + KNN + SVM jalan bareng")
+        return [load_single_model(i) for i in [1, 2, 3]]
+    elif mode in [1, 2, 3]:
+        names = {1: "ANN", 2: "KNN", 3: "SVM"}
+        print(f"[MODE] {names[mode]} saja")
+        return [load_single_model(mode)]
+    else:
+        raise ValueError(f"MODEL_SELECT tidak valid: {mode}. Gunakan 0/1/2/3.")
+
+
+# ============================================================
+# Rekam Audio
+# ============================================================
+def record_audio():
+    command = [
+        'arecord',
+        '-D', 'plughw:1,0',
+        '-d', str(RECORD_SECONDS),
+        '-f', 'S16_LE', '-r', str(SAMPLE_RATE),
+        '-c', '1', '-t', 'raw', '-q'
+    ]
+    raw_audio   = subprocess.check_output(command)
+    audio_array = np.frombuffer(raw_audio, dtype=np.int16)
+
+    if len(audio_array) > EXPECTED_LEN:
+        audio_array = audio_array[:EXPECTED_LEN]
+    elif len(audio_array) < EXPECTED_LEN:
+        audio_array = np.pad(audio_array, (0, EXPECTED_LEN - len(audio_array)), 'constant')
+
+    return audio_array
+
+
+# ============================================================
+# Normalisasi Audio
+# ============================================================
+def normalize_audio(audio_array):
+    audio_float = audio_array.astype(np.float32)
+    max_val     = np.max(np.abs(audio_float))
+    if max_val > 0:
+        audio_float = (audio_float / max_val) * 32767.0
+    return audio_float.astype(np.int16)
+
+
+# ============================================================
+# Hitung RMS
+# ============================================================
+def get_rms(audio_array):
+    return np.sqrt(np.mean(audio_array.astype(np.float32) ** 2))
+
+
+# ============================================================
+# Ekstrak Fitur
+# ============================================================
+def extract_features(audio_array):
+    mfe = python_speech_features.logfbank(
+        audio_array, SAMPLE_RATE,
+        winlen=0.02, winstep=0.02,
+        nfilt=40, nfft=512
+    )
+    return mfe.flatten().reshape(1, -1)
+
+
+# ============================================================
+# Prediksi ML
+# ============================================================
+def predict_single(model_data, features):
+    f_scaled = model_data["scaler"].transform(features)
+    f_pca    = model_data["pca"].transform(f_scaled)
+    return model_data["model"].predict(f_pca)[0]
+
+
+# ============================================================
+# Smoothing: Majority Voting Window
+# ============================================================
+class SmoothingBuffer:
+    def __init__(self, window=SMOOTH_WINDOW):
+        self.window = window
+        self.buffer = []
+
+    def update(self, raw_label):
+        self.buffer.append(raw_label)
+        if len(self.buffer) > self.window:
+            self.buffer.pop(0)
+
+        snoring_count = self.buffer.count("Snoring")
+        if snoring_count > len(self.buffer) // 2:
+            return "Snoring"
+        return "Non-Snoring"
+
+    def reset(self):
+        self.buffer = []
+
+
+# ============================================================
+# Vosk Keyword Spotter (thread agar tidak blocking)
+# ============================================================
+class KeywordSpotter:
+    def __init__(self):
+        self.available    = False
+        self.keyword_flag = None
+        self.lock         = threading.Lock()
+
+        if VOSK_AVAILABLE and os.path.isdir(VOSK_MODEL_PATH):
+            try:
+                self.model     = VoskModel(model_path=VOSK_MODEL_PATH)
+                self.available = True
+                print("[VOSK] Keyword spotter siap.")
+            except Exception as e:
+                print(f"[VOSK ERROR] Gagal load model: {e}")
+        else:
+            if not VOSK_AVAILABLE:
+                print("[VOSK] Library vosk tidak tersedia.")
+            else:
+                print(f"[VOSK] Model tidak ditemukan di: {VOSK_MODEL_PATH}")
+
+    def check_async(self, audio_array, keywords):
+        if not self.available:
+            return
+
+        def _run():
+            try:
+                recognizer  = KaldiRecognizer(self.model, SAMPLE_RATE)
+                audio_bytes = audio_array.astype(np.int16).tobytes()
+                recognizer.AcceptWaveform(audio_bytes)
+                result = json.loads(recognizer.Result())
+                text   = result.get("text", "").lower().strip()
+                if text:
+                    print(f"  [VOSK] Terdengar: '{text}'")
+                    for kw in keywords:
+                        if kw.lower() in text:
+                            with self.lock:
+                                self.keyword_flag = kw
+                            break
+            except Exception:
+                pass
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def pop_flag(self):
+        with self.lock:
+            flag              = self.keyword_flag
+            self.keyword_flag = None
+        return flag
+
+
+# ============================================================
+# Apnea State Machine
+# ============================================================
+class ApneaStateMachine:
+    STATE_NORMAL        = "NORMAL"
+    STATE_SNORING       = "SNORING"
+    STATE_SILENCE_WATCH = "SILENCE_WATCH"
+
+    def __init__(self):
+        self.state            = self.STATE_NORMAL
+        self.snoring_streak   = 0
+        self.silence_streak   = 0
+        self.noise_in_silence = 0
+        self.apnea_count      = 0
+        self.apnea_events     = []
+        self.session_stats    = {
+            "snoring_seconds": 0,
+            "normal_seconds":  0,
+        }
+
+    def update(self, label, timestamp):
+        is_snoring     = (label == "Snoring")
+        is_non_snoring = (label == "Non-Snoring")
+
+        if is_snoring:
+            self.session_stats["snoring_seconds"] += 1
+        else:
+            self.session_stats["normal_seconds"] += 1
+
+        apnea_triggered = False
+        notes           = ""
+
+        if self.state == self.STATE_NORMAL:
+            if is_snoring:
+                self.snoring_streak += 1
+                if self.snoring_streak >= SNORING_CONFIRM_SEC:
+                    self.state = self.STATE_SNORING
+                    notes = f"snoring_confirmed ({self.snoring_streak}s)"
+            else:
+                self.snoring_streak = 0
+
+        elif self.state == self.STATE_SNORING:
+            if is_snoring:
+                self.snoring_streak += 1
+            elif is_non_snoring:
+                self.state            = self.STATE_SILENCE_WATCH
+                self.silence_streak   = 1
+                self.noise_in_silence = 0
+                self.snoring_streak   = 0
+                notes = "silence_start"
+
+        elif self.state == self.STATE_SILENCE_WATCH:
+            if is_non_snoring:
+                self.silence_streak += 1
+                if self.silence_streak > APNEA_MAX_SILENCE:
+                    self.state          = self.STATE_NORMAL
+                    self.silence_streak = 0
+                    self.snoring_streak = 0
+                    notes = "silence_too_long_reset"
+
+            elif is_snoring:
+                if self.silence_streak >= APNEA_MIN_SILENCE:
+                    self.apnea_count += 1
+                    self.apnea_events.append({
+                        "timestamp":        timestamp,
+                        "silence_duration": self.silence_streak,
+                    })
+                    apnea_triggered = True
+                    notes = f"apnea_confirmed ({self.silence_streak}s)"
+                    print(f"\n  *** APNEA #{self.apnea_count} TERDETEKSI! "
+                          f"(non-snoring {self.silence_streak}s) ***\n")
+                else:
+                    notes = f"short_pause ({self.silence_streak}s, not apnea)"
+
+                self.state          = self.STATE_SNORING
+                self.snoring_streak = 1
+                self.silence_streak = 0
+
+        return {
+            "state":           self.state,
+            "apnea_count":     self.apnea_count,
+            "apnea_triggered": apnea_triggered,
+            "snoring_streak":  self.snoring_streak,
+            "silence_streak":  self.silence_streak,
+            "notes":           notes,
+        }
+
+    def get_summary(self):
+        return {
+            "apnea_count":     self.apnea_count,
+            "apnea_events":    self.apnea_events,
+            "snoring_seconds": self.session_stats["snoring_seconds"],
+            "silence_seconds": 0,
+            "normal_seconds":  self.session_stats["normal_seconds"],
+        }
+
+
+# ============================================================
+# Hitung Severity AHI
+# ============================================================
+def calculate_ahi_severity(apnea_count, total_seconds):
+    if total_seconds <= 0:
+        return 0.0, "Normal"
+    session_hours = total_seconds / 3600
+    ahi = round(apnea_count / session_hours, 1) if session_hours > 0 else 0.0
+    if ahi < 5:
+        severity = "Normal"
+    elif ahi < 15:
+        severity = "Mild"
+    elif ahi < 30:
+        severity = "Moderate"
+    else:
+        severity = "Severe"
+    return ahi, severity
+
+
+# ============================================================
+# Data Logger
+# ============================================================
+class DataLogger:
+    def __init__(self):
+        now                = datetime.now()
+        self.session_start = now
+        self.filename      = now.strftime("%Y-%m-%d_%H-%M-%S") + ".csv"
+        self.filepath      = os.path.join(LOG_DIR, self.filename)
+        self.csv_file      = None
+        self.csv_writer    = None
+
+    def start(self):
+        self.csv_file   = open(self.filepath, 'w', newline='')
+        self.csv_writer = csv.writer(self.csv_file)
+        self.csv_writer.writerow([
+            "timestamp", "label", "rms_volume", "state",
+            "apnea_count", "snoring_streak", "silence_streak", "notes"
+        ])
+        self.csv_file.flush()
+        print(f"[LOG] CSV dimulai: {self.filepath}")
+
+    def log(self, label, rms, state_info):
+        if self.csv_writer is None:
+            return
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.csv_writer.writerow([
+            now, label, f"{rms:.0f}",
+            state_info["state"],
+            state_info["apnea_count"],
+            state_info["snoring_streak"],
+            state_info["silence_streak"],
+            state_info["notes"],
+        ])
+        self.csv_file.flush()
+
+    def stop(self):
+        if self.csv_file:
+            self.csv_file.close()
+            self.csv_file   = None
+            self.csv_writer = None
+            print(f"[LOG] CSV selesai: {self.filepath}")
+
+    def push_to_spreadsheet(self, summary, total_seconds):
+        if not REQUESTS_AVAILABLE or not SPREADSHEET_URL:
+            print("[LOG] Spreadsheet push dilewati.")
+            return False
+
+        session_end      = datetime.now()
+        duration         = session_end - self.session_start
+        hours, remainder = divmod(int(duration.total_seconds()), 3600)
+        minutes, seconds = divmod(remainder, 60)
+
+        # Hitung AHI dan severity
+        ahi, severity = calculate_ahi_severity(
+            summary.get("apnea_count", 0), total_seconds
+        )
+
+        # Hitung persentase snoring
+        total_sec    = summary.get("snoring_seconds", 0) + summary.get("normal_seconds", 0)
+        snoring_pct  = round(
+            summary.get("snoring_seconds", 0) / total_sec * 100, 1
+        ) if total_sec > 0 else 0.0
+
+        apnea_details = "; ".join([
+            f"{e['timestamp']} ({e['silence_duration']}s)"
+            for e in summary.get("apnea_events", [])
+        ]) or "Tidak ada"
+
+        payload = {
+            "date":            self.session_start.strftime("%Y-%m-%d"),
+            "start_time":      self.session_start.strftime("%H:%M:%S"),
+            "end_time":        session_end.strftime("%H:%M:%S"),
+            "duration":        f"{hours:02d}:{minutes:02d}:{seconds:02d}",
+            "snoring_seconds": summary.get("snoring_seconds", 0),
+            "normal_seconds":  summary.get("normal_seconds", 0),
+            "snoring_pct":     snoring_pct,
+            "apnea_count":     summary.get("apnea_count", 0),
+            "ahi":             ahi,
+            "severity":        severity,
+            "apnea_details":   apnea_details,
+            "csv_file":        self.filename,
+        }
+
+        try:
+            print("[LOG] Mengirim data ke Spreadsheet...")
+            resp = requests.post(SPREADSHEET_URL, json=payload, timeout=15)
+            if resp.status_code == 200:
+                print("[LOG] Spreadsheet berhasil diupdate!")
+                return True
+            else:
+                print(f"[LOG] Spreadsheet error: {resp.status_code} - {resp.text}")
+                return False
+        except Exception as e:
+            print(f"[LOG] Spreadsheet push gagal: {e}")
+            return False
+
+
+# ============================================================
+# Format Durasi
+# ============================================================
+def format_duration(seconds):
+    h, remainder = divmod(int(seconds), 3600)
+    m, s         = divmod(remainder, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+# ============================================================
+# Update OLED via Bridge
+# ============================================================
+def update_oled(state_info, label):
+    try:
+        state_map = {
+            "NORMAL":        "set_state0",
+            "SNORING":       "set_state1",
+            "SILENCE_WATCH": "set_state2",
+        }
+        Bridge.call(state_map.get(state_info["state"], "set_state0"))
+
+        label_map = {
+            "Non-Snoring": "set_label_norm",
+            "Snoring":     "set_label_snor",
+        }
+        Bridge.call(label_map.get(label, "set_label_norm"))
+
+        if state_info["apnea_triggered"]:
+            Bridge.call("apnea_event")
+
+        Bridge.call("refresh_oled")
+
+    except Exception:
+        pass
+
+
+# ============================================================
+# Main Inference Loop
+# ============================================================
+def live_inference_loop():
+    models   = load_models(MODEL_SELECT)
+    is_multi = (MODEL_SELECT == 0)
+
+    if is_multi:
+        mode_label = "ALL (ANN+KNN+SVM)"
+    else:
+        mode_label = models[0]["name"]
+
+    print("=" * 50)
+    print(f"  SLEEP APNEA DETECTION - {mode_label}")
+    print(f"  Sample Rate   : {SAMPLE_RATE} Hz")
+    print(f"  Smooth Window : {SMOOTH_WINDOW} detik")
+    print("=" * 50)
+
+    bridge_model_calls = {"ANN": "set_ann", "KNN": "set_knn", "SVM": "set_svm"}
+    try:
+        if is_multi:
+            Bridge.call("set_all")
+        else:
+            Bridge.call(bridge_model_calls[mode_label])
+    except Exception:
+        pass
+
+    kws = KeywordSpotter()
+
+    # ========================================================
+    # FASE IDLE
+    # ========================================================
+    print("\n[IDLE] Menunggu perintah suara 'start'...")
+    print("[IDLE] Ucapkan 'start' untuk mulai merekam.\n")
+
+    try:
+        Bridge.call("show_idle")
+    except Exception:
+        pass
+
+    START_KEYWORDS = ["start", "stay", "go", "begin", "record", "play"]
+
+    while True:
+        try:
+            audio_array = record_audio()
+
+            if kws.available:
+                kws.check_async(audio_array, START_KEYWORDS)
+                flag = kws.pop_flag()
+                if flag:
+                    print(f"\n[VOSK] Keyword START terdeteksi ('{flag}')!")
+                    break
+            else:
+                print("[WARN] Vosk tidak aktif, memulai otomatis dalam 5 detik...")
+                time.sleep(5)
+                break
+
+            time.sleep(0.5)
+
+        except subprocess.CalledProcessError:
+            print("[ERROR] Gagal mengakses mikrofon.")
+            time.sleep(1)
+        except Exception as e:
+            print(f"[ERROR] {e}")
+            time.sleep(1)
+
+    # ========================================================
+    # FASE RECORDING
+    # ========================================================
+    print("\n" + "=" * 50)
+    print("  RECORDING DIMULAI!")
+    print("=" * 50)
+
+    try:
+        Bridge.call("session_start")
+    except Exception:
+        pass
+
+    state_machine      = ApneaStateMachine()
+    smoother           = SmoothingBuffer(window=SMOOTH_WINDOW)
+    logger             = DataLogger()
+    logger.start()
+    session_start_time = time.time()
+
+    STOP_KEYWORDS = ["stop", "top", "store", "end", "finish", "halt", "quit", "pause"]
+
+    print("[REC] Deteksi aktif. Ucapkan 'stop' untuk berhenti.\n")
+
+    while True:
+        try:
+            audio_array = record_audio()
+            now_str     = datetime.now().strftime("%H:%M:%S")
+
+            # Vosk di thread terpisah
+            if kws.available:
+                kws.check_async(audio_array, STOP_KEYWORDS)
+                flag = kws.pop_flag()
+                if flag:
+                    print(f"\n[VOSK] Keyword STOP terdeteksi ('{flag}')!")
+                    break
+
+            # Hitung RMS untuk logging
+            rms = get_rms(audio_array)
+
+            # Normalisasi + ekstrak fitur + prediksi ML
+            audio_normalized = normalize_audio(audio_array)
+            features         = extract_features(audio_normalized)
+
+            if is_multi:
+                preds = {}
+                for md in models:
+                    preds[md["name"]] = predict_single(md, features)
+                votes      = list(preds.values())
+                final_pred = max(set(votes), key=votes.count)
+            else:
+                final_pred = predict_single(models[0], features)
+
+            # Raw label
+            raw_label = {1: "Snoring"}.get(final_pred, "Non-Snoring")
+
+            # Smoothing: majority voting window
+            label = smoother.update(raw_label)
+
+            print(f"  [{now_str}] {label} (raw: {raw_label}, RMS: {rms:.0f})")
+
+            # Update state machine
+            state_info = state_machine.update(label, now_str)
+
+            # Log ke CSV
+            logger.log(label, rms, state_info)
+
+            # Update OLED
+            update_oled(state_info, label)
+
+            if state_info["notes"]:
+                print(f"    -> [{state_info['state']}] {state_info['notes']}")
+
+            time.sleep(0.1)
+
+        except subprocess.CalledProcessError:
+            print("[ERROR] Gagal mengakses mikrofon ALSA.")
+            time.sleep(1)
+        except Exception as e:
+            print(f"[ERROR] {e}")
+            time.sleep(1)
+
+    # ========================================================
+    # FASE SESSION END
+    # ========================================================
+    print("\n" + "=" * 50)
+    print("  RECORDING SELESAI!")
+    print("=" * 50)
+
+    total_elapsed = time.time() - session_start_time
+    summary       = state_machine.get_summary()
+    total_seconds = summary["snoring_seconds"] + summary["normal_seconds"]
+    ahi, severity = calculate_ahi_severity(summary["apnea_count"], total_seconds)
+    snoring_pct   = round(
+        summary["snoring_seconds"] / total_seconds * 100, 1
+    ) if total_seconds > 0 else 0.0
+
+    print(f"\n  Durasi Sesi    : {format_duration(total_elapsed)}")
+    print(f"  Total Snoring  : {summary['snoring_seconds']}s ({snoring_pct}%)")
+    print(f"  Total Normal   : {summary['normal_seconds']}s")
+    print(f"  Kejadian Apnea : {summary['apnea_count']}")
+    print(f"  AHI            : {ahi} events/jam")
+    print(f"  Severity       : {severity}")
+
+    if summary['apnea_events']:
+        print(f"\n  Detail Apnea:")
+        for i, evt in enumerate(summary['apnea_events'], 1):
+            print(f"    #{i}: {evt['timestamp']} (non-snoring {evt['silence_duration']}s)")
+
+    logger.stop()
+    logger.push_to_spreadsheet(summary, total_elapsed)
+
+    try:
+        Bridge.call("session_stop")
+    except Exception:
+        pass
+
+    print(f"\n  CSV tersimpan : {logger.filepath}")
+    print("  Sesi selesai. Kembali ke mode IDLE...\n")
+
+    time.sleep(3)
+    live_inference_loop()
+
+
+# ============================================================
+if __name__ == "__main__":
+    time.sleep(2)
+    live_inference_loop()
