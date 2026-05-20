@@ -1,0 +1,228 @@
+#include <Wire.h>
+#include <U8g2lib.h>
+#include <Arduino_RouterBridge.h>
+
+#define BUZZER_PIN  9
+#define LED_PIN     A0
+
+// I2C 128x64 SSD1306, full frame buffer, hardware I2C
+U8G2_SSD1306_128X64_NONAME_F_HW_I2C display(U8G2_R0, /* reset= */ U8X8_PIN_NONE);
+
+String activeModel = "---";
+bool isRecording = false;
+
+String currentState    = "NORMAL";
+String currentLabel    = "---";
+String currentDuration = "00:00:00";
+int    currentApnea    = 0;
+int    currentSnoring  = 0;
+int    currentSilence  = 0;
+String currentDurSum   = "--:--:--";
+
+// ── Buzzer ───────────────────────────────────────────────────────
+void beepStart() {
+  tone(BUZZER_PIN, 1047, 150);
+  digitalWrite(LED_PIN, HIGH);
+  delay(200);
+  noTone(BUZZER_PIN);
+  digitalWrite(LED_PIN, LOW);
+}
+
+void beepStop() {
+  tone(BUZZER_PIN, 784, 500);
+  digitalWrite(LED_PIN, HIGH);
+  delay(600);
+  noTone(BUZZER_PIN);
+  digitalWrite(LED_PIN, LOW);
+}
+
+void beepApnea() {
+  for (int i = 0; i < 3; i++) {
+    tone(BUZZER_PIN, 1047, 100);
+    digitalWrite(LED_PIN, HIGH);
+    delay(150);
+    noTone(BUZZER_PIN);
+    digitalWrite(LED_PIN, LOW);
+    delay(50);
+  }
+}
+
+// ── OLED: IDLE ───────────────────────────────────────────────────
+void showIdle() {
+  display.clearBuffer();
+
+  // Double border
+  display.drawFrame(0, 0, 128, 64);
+  display.drawFrame(2, 2, 124, 60);
+
+  // Title
+  display.setFont(u8g2_font_6x10_tf);
+  display.drawStr(18, 14, "SLEEP MONITOR");
+  display.drawHLine(8, 17, 112);
+
+  // Body
+  display.drawStr(20, 28, "Status: IDLE");
+  display.drawStr(10, 40, "Say 'START' to");
+  display.drawStr(10, 50, "begin recording");
+
+  // Model
+  String modelLine = "Model: " + activeModel;
+  display.drawStr(10, 61, modelLine.c_str());
+
+  display.sendBuffer();
+}
+
+// ── OLED: Recording ──────────────────────────────────────────────
+void showRecording() {
+  display.clearBuffer();
+
+  // Outer border
+  display.drawFrame(0, 0, 128, 64);
+
+  // Inverted header bar
+  display.drawBox(1, 1, 126, 12);
+  display.setDrawColor(0);  // black on white
+  String recLine = "* REC  " + currentDuration;
+  display.setFont(u8g2_font_6x10_tf);
+  display.drawStr(8, 11, recLine.c_str());
+  display.setDrawColor(1);  // restore white on black
+
+  // Status lines
+  String detLine = "Det: " + currentLabel;
+  String staLine = "Sta: " + currentState;
+  String apnLine = "Apnea: " + String(currentApnea) + " events";
+  String mdlLine = "Model: " + activeModel;
+
+  display.drawStr(4, 24, detLine.c_str());
+  display.drawStr(4, 34, staLine.c_str());
+  display.drawStr(4, 44, apnLine.c_str());
+  display.drawHLine(4, 49, 120);
+  display.drawStr(4, 61, mdlLine.c_str());
+
+  display.sendBuffer();
+}
+
+// ── OLED: Summary ────────────────────────────────────────────────
+void showSummary() {
+  display.clearBuffer();
+
+  // White filled background
+  display.drawBox(0, 0, 128, 64);
+
+  // Dark title bar inside
+  display.setDrawColor(0);
+  display.drawBox(2, 2, 124, 13);
+  display.setDrawColor(1);
+  display.drawStr(20, 13, "SESSION SUMMARY");
+
+  // Body text (black on white → invert draw color)
+  display.setDrawColor(0);
+
+  String durLine  = "Durasi : " + currentDurSum;
+  String snorLine = "Ngorok : " + String(currentSnoring) + "s";
+  String silLine  = "Sunyi  : " + String(currentSilence) + "s";
+  String apnLine  = "Apnea  : " + String(currentApnea) + " events";
+
+  display.drawStr(6, 26, durLine.c_str());
+  display.drawStr(6, 36, snorLine.c_str());
+  display.drawStr(6, 46, silLine.c_str());
+  display.drawStr(6, 56, apnLine.c_str());
+
+  display.setDrawColor(1);  // restore
+
+  display.sendBuffer();
+}
+
+// ── Bridge Callbacks ─────────────────────────────────────────────
+
+void onShowIdle() {
+  isRecording = false;
+  showIdle();
+  Monitor.println("Mode: IDLE");
+}
+
+void onSessionStart() {
+  isRecording     = true;
+  currentState    = "NORMAL";
+  currentLabel    = "---";
+  currentDuration = "00:00:00";
+  currentApnea    = 0;
+  beepStart();
+  showRecording();
+  Monitor.println("Session: STARTED");
+}
+
+void onSessionStop() {
+  isRecording = false;
+  showSummary();
+  beepStop();
+  Monitor.println("Session: STOPPED");
+}
+
+void onSetState0()    { currentState = "NORMAL";  }
+void onSetState1()    { currentState = "SNORING"; }
+void onSetState2()    { currentState = "SILENCE"; }
+
+void onSetLabelNorm() { currentLabel = "Non-Snoring"; }
+void onSetLabelSnor() { currentLabel = "Snoring";     }
+void onSetLabelSuny() { currentLabel = "Sunyi";       }
+
+void onApneaEvent() {
+  currentApnea++;
+  beepApnea();
+  Monitor.print("Apnea #");
+  Monitor.println(currentApnea);
+  if (isRecording) showRecording();
+}
+
+void onRefreshOLED() {
+  if (isRecording) showRecording();
+}
+
+void onSumSnor0()  { currentSnoring = 0; }
+void onSumApnea0() { currentApnea   = 0; }
+
+void onSetANN() { activeModel = "ANN"; Monitor.println("Model: ANN"); if (!isRecording) showIdle(); }
+void onSetKNN() { activeModel = "KNN"; Monitor.println("Model: KNN"); if (!isRecording) showIdle(); }
+void onSetSVM() { activeModel = "SVM"; Monitor.println("Model: SVM"); if (!isRecording) showIdle(); }
+void onSetALL() { activeModel = "ALL"; Monitor.println("Model: ALL"); if (!isRecording) showIdle(); }
+
+// ── Setup ────────────────────────────────────────────────────────
+void setup() {
+  Wire.begin();
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+
+  Bridge.begin();
+  Monitor.begin();
+
+  if (!display.begin()) {
+    Monitor.println("OLED FAILED");
+    while (1);
+  }
+
+  Bridge.provide("show_idle",       onShowIdle);
+  Bridge.provide("session_start",   onSessionStart);
+  Bridge.provide("session_stop",    onSessionStop);
+  Bridge.provide("set_state0",      onSetState0);
+  Bridge.provide("set_state1",      onSetState1);
+  Bridge.provide("set_state2",      onSetState2);
+  Bridge.provide("set_label_norm",  onSetLabelNorm);
+  Bridge.provide("set_label_snor",  onSetLabelSnor);
+  Bridge.provide("set_label_suny",  onSetLabelSuny);
+  Bridge.provide("apnea_event",     onApneaEvent);
+  Bridge.provide("refresh_oled",    onRefreshOLED);
+  Bridge.provide("set_ann",         onSetANN);
+  Bridge.provide("set_knn",         onSetKNN);
+  Bridge.provide("set_svm",         onSetSVM);
+  Bridge.provide("set_all",         onSetALL);
+
+  Monitor.println("Ready - Sleep Apnea Monitor v2.0");
+  showIdle();
+}
+
+// ── Loop ─────────────────────────────────────────────────────────
+void loop() {
+  yield();
+}
