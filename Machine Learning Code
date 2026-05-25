@@ -47,6 +47,7 @@ MODEL_SELECT = 0
 SAMPLE_RATE    = 16000
 RECORD_SECONDS = 1
 EXPECTED_LEN   = 16000
+DIGITAL_GAIN   = 3.0  # <--- Penguat volume digital (ubah ke 5.0 atau 10.0 jika masih kurang)
 
 # ============================================================
 # Konfigurasi Smoothing Window
@@ -60,6 +61,7 @@ SNORING_CONFIRM_SEC = 5
 APNEA_MIN_SILENCE   = 10
 APNEA_MAX_SILENCE   = 120
 NOISE_TOLERANCE     = 2
+NORMAL_PAUSE_SEC    = 4  # Toleransi jeda tarik nafas (detik) antar dengkuran
 
 # ============================================================
 # Konfigurasi Vosk
@@ -81,12 +83,12 @@ SPREADSHEET_URL = "https://script.google.com/macros/s/AKfycbwz0QIFCIOjhwpDpm4xmG
 # ============================================================
 def load_single_model(model_id):
     model_files = {
-        1: ("ann_model.pkl", "ann_scaler.pkl", "ann_pca.pkl", "ANN"),
-        2: ("knn_model.pkl", "knn_scaler.pkl", "knn_pca.pkl", "KNN"),
-        3: ("svm_model.pkl", "svm_scaler.pkl", "svm_pca.pkl", "SVM"),
+        1: ("ann_mfcc_model.pkl", "ann_mfcc_scaler.pkl", "ann_mfcc_pca.pkl", "ANN"),
+        2: ("knn_mfcc_model.pkl", "knn_mfcc_scaler.pkl", "knn_mfcc_pca.pkl", "KNN"),
+        3: ("svm_mfcc_model.pkl", "svm_mfcc_scaler.pkl", "svm_mfcc_pca.pkl", "SVM"),
     }
     m_file, s_file, p_file, name = model_files[model_id]
-    models_dir = os.path.join(BASE_DIR, "models")
+    models_dir = os.path.join(BASE_DIR, "models_mfcc")
     print(f"  Memuat {name} dari {BASE_DIR}...")
     return {
         "name":   name,
@@ -109,18 +111,53 @@ def load_models(mode):
 
 
 # ============================================================
+# Auto-Detect Audio Device
+# ============================================================
+_cached_audio_device = None
+
+def detect_audio_device():
+    global _cached_audio_device
+    if _cached_audio_device is not None:
+        return _cached_audio_device
+
+    try:
+        output = subprocess.check_output(['arecord', '-l'], stderr=subprocess.STDOUT).decode()
+        import re
+        matches = re.findall(r'card\s+(\d+):', output)
+        if matches:
+            card_num = matches[0]
+            device = f"plughw:{card_num},0"
+            print(f"[AUDIO] Mikrofon terdeteksi: {device}")
+            _cached_audio_device = device
+            return device
+    except Exception as e:
+        print(f"[AUDIO WARN] Gagal auto-detect: {e}")
+
+    print("[AUDIO] Fallback ke 'default'")
+    _cached_audio_device = "default"
+    return "default"
+
+
+# ============================================================
 # Rekam Audio
 # ============================================================
 def record_audio():
+    device = detect_audio_device()
     command = [
         'arecord',
-        '-D', 'plughw:1,0',
+        '-D', device,
         '-d', str(RECORD_SECONDS),
         '-f', 'S16_LE', '-r', str(SAMPLE_RATE),
         '-c', '1', '-t', 'raw', '-q'
     ]
     raw_audio   = subprocess.check_output(command)
-    audio_array = np.frombuffer(raw_audio, dtype=np.int16)
+    audio_array = np.frombuffer(raw_audio, dtype=np.int16).astype(np.float32)
+
+    # Terapkan penguatan volume digital
+    if DIGITAL_GAIN != 1.0:
+        audio_array = np.clip(audio_array * DIGITAL_GAIN, -32768, 32767)
+    
+    audio_array = audio_array.astype(np.int16)
 
     if len(audio_array) > EXPECTED_LEN:
         audio_array = audio_array[:EXPECTED_LEN]
@@ -152,12 +189,12 @@ def get_rms(audio_array):
 # Ekstrak Fitur
 # ============================================================
 def extract_features(audio_array):
-    mfe = python_speech_features.logfbank(
+    mfcc_feat = python_speech_features.mfcc(
         audio_array, SAMPLE_RATE,
-        winlen=0.02, winstep=0.02,
+        winlen=0.02, winstep=0.02, numcep=13,
         nfilt=40, nfft=512
     )
-    return mfe.flatten().reshape(1, -1)
+    return mfcc_feat.flatten().reshape(1, -1)
 
 
 # ============================================================
@@ -252,13 +289,14 @@ class ApneaStateMachine:
     STATE_SILENCE_WATCH = "SILENCE_WATCH"
 
     def __init__(self):
-        self.state            = self.STATE_NORMAL
-        self.snoring_streak   = 0
-        self.silence_streak   = 0
-        self.noise_in_silence = 0
-        self.apnea_count      = 0
-        self.apnea_events     = []
-        self.session_stats    = {
+        self.state               = self.STATE_NORMAL
+        self.snoring_streak      = 0
+        self.silence_streak      = 0
+        self.noise_in_silence    = 0
+        self.normal_pause_streak = 0
+        self.apnea_count         = 0
+        self.apnea_events        = []
+        self.session_stats       = {
             "snoring_seconds": 0,
             "normal_seconds":  0,
         }
@@ -287,12 +325,19 @@ class ApneaStateMachine:
         elif self.state == self.STATE_SNORING:
             if is_snoring:
                 self.snoring_streak += 1
+                self.normal_pause_streak = 0
             elif is_non_snoring:
-                self.state            = self.STATE_SILENCE_WATCH
-                self.silence_streak   = 1
-                self.noise_in_silence = 0
-                self.snoring_streak   = 0
-                notes = "silence_start"
+                self.normal_pause_streak += 1
+                if self.normal_pause_streak <= NORMAL_PAUSE_SEC:
+                    self.snoring_streak += 1
+                    notes = f"jeda_nafas ({self.normal_pause_streak}s)"
+                else:
+                    self.state               = self.STATE_SILENCE_WATCH
+                    self.silence_streak      = self.normal_pause_streak
+                    self.noise_in_silence    = 0
+                    self.snoring_streak      = 0
+                    self.normal_pause_streak = 0
+                    notes = "silence_start"
 
         elif self.state == self.STATE_SILENCE_WATCH:
             if is_non_snoring:
@@ -445,7 +490,7 @@ class DataLogger:
 
         try:
             print("[LOG] Mengirim data ke Spreadsheet...")
-            resp = requests.post(SPREADSHEET_URL, json=payload, timeout=15)
+            resp = requests.post(SPREADSHEET_URL, json=payload, timeout=30)
             if resp.status_code == 200:
                 print("[LOG] Spreadsheet berhasil diupdate!")
                 return True
