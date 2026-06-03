@@ -1,0 +1,801 @@
+import sys, io
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+
+"""
+=============================================================================
+DETEKSI APNEA vs SNORING BIASA
+Pola Apnea: Ngorok -> Hening (>=10 detik) -> Ngorok lagi
+=============================================================================
+Dataset:
+  folder 0/ = snoring normal (_normal_*.wav)  -> label 0
+  folder 1/ = apnea         (_apnea_*.wav)   -> label 1
+
+Setiap file = 1 detik, 4000 Hz, mono, 16-bit PCM
+MFCC: 8 frame (4000 samples / 512 hop), delta memerlukan width<=8
+=============================================================================
+"""
+
+import os
+import glob
+import time
+import warnings
+import numpy as np
+import librosa
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import seaborn as sns
+from collections import Counter
+
+from sklearn.model_selection import train_test_split, StratifiedKFold, cross_val_score
+from sklearn.preprocessing import StandardScaler
+from sklearn.svm import SVC
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import (
+    accuracy_score, precision_score, recall_score, f1_score,
+    confusion_matrix, classification_report, roc_auc_score,
+    roc_curve
+)
+
+warnings.filterwarnings('ignore')
+np.random.seed(42)
+
+# ─────────────────────────────────────────────
+# KONFIGURASI
+# ─────────────────────────────────────────────
+DATASET_DIR = r"d:\TA_AGOY\Apnea Dataset"
+OUTPUT_DIR  = r"d:\TA_AGOY\Apnea Dataset\hasil_ml"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+SR          = 4000      # sample rate
+MAX_FILES   = 2000      # max file per kelas
+N_MFCC      = 13       # MFCC coefficients
+# Dengan SR=4000 dan 1 detik: n_frames = 1 + (4000 - 2048) // 512 = 8 frame
+# librosa.feature.delta(width=3) aman untuk 8 frame (width harus < n_frames)
+DELTA_WIDTH = 3
+APNEA_SILENCE_THRESHOLD = 10  # detik minimum hening = apnea
+
+SEP = "=" * 65
+
+def section(title):
+    print(f"\n{SEP}\n  {title}\n{SEP}")
+
+# ─────────────────────────────────────────────
+# 1. EKSTRAKSI FITUR PER-SEGMEN (1 detik)
+# ─────────────────────────────────────────────
+def extract_features(audio, sr=SR):
+    """
+    Ekstrak 43 fitur dari 1 segmen audio (1 detik) @ 4000 Hz:
+      - MFCC mean (13) + std (13) = 26 fitur
+      - Delta-MFCC mean (13) dengan width=3 = 13 fitur  [width < n_frames=8]
+      - RMS Energy (1), ZCR (1), Spec Centroid (1), Rolloff (1), Bandwidth (1) = 5
+    Total: 44 fitur
+    """
+    # Pastikan panjang minimal
+    if len(audio) < 2048:
+        audio = np.pad(audio, (0, 2048 - len(audio)))
+
+    # MFCC (13 koefisien, 8 frame)
+    mfcc       = librosa.feature.mfcc(y=audio, sr=sr, n_mfcc=N_MFCC)
+    mfcc_mean  = np.mean(mfcc, axis=1)   # shape: (13,)
+    mfcc_std   = np.std(mfcc, axis=1)    # shape: (13,)
+
+    # Delta MFCC dengan width=3 (aman untuk 8 frame)
+    delta_mfcc = librosa.feature.delta(mfcc, width=DELTA_WIDTH)
+    delta_mean = np.mean(delta_mfcc, axis=1)  # shape: (13,)
+
+    # Energy & Spectral features
+    rms        = float(np.sqrt(np.mean(audio ** 2)))
+    zcr        = float(np.mean(librosa.feature.zero_crossing_rate(audio)))
+    spec_cent  = float(np.mean(librosa.feature.spectral_centroid(y=audio, sr=sr)))
+    spec_roll  = float(np.mean(librosa.feature.spectral_rolloff(y=audio, sr=sr)))
+    spec_bw    = float(np.mean(librosa.feature.spectral_bandwidth(y=audio, sr=sr)))
+
+    feat = np.concatenate([
+        mfcc_mean, mfcc_std, delta_mean,
+        [rms, zcr, spec_cent, spec_roll, spec_bw]
+    ])
+    return feat.astype(np.float32)
+
+# ─────────────────────────────────────────────
+# 2. LOAD DATASET
+# ─────────────────────────────────────────────
+section("MEMUAT DATASET & MENGEKSTRAK FITUR")
+print(f"Dataset: {DATASET_DIR}")
+
+def load_class(folder, label, max_files=MAX_FILES):
+    files = sorted(glob.glob(os.path.join(folder, "*.wav")))[:max_files]
+    feats    = []
+    rms_vals = []
+    errors   = 0
+    print(f"\n  Kelas {label} ({os.path.basename(folder)}): {len(files)} file")
+    for i, fp in enumerate(files):
+        if i % 500 == 0:
+            pct = i / len(files) * 100
+            print(f"\r    Progress: {i}/{len(files)} ({pct:.0f}%)", end="", flush=True)
+        try:
+            audio, _ = librosa.load(fp, sr=SR, mono=True)
+            feat = extract_features(audio)
+            rms_val = float(np.sqrt(np.mean(audio ** 2)))
+            feats.append(feat)
+            rms_vals.append(rms_val)
+        except Exception:
+            errors += 1
+    pct = 100
+    print(f"\r    Selesai: {len(feats)}/{len(files)} file OK, {errors} error   ")
+    X = np.array(feats, dtype=np.float32)
+    y = np.full(len(feats), label, dtype=int)
+    return X, y, np.array(rms_vals, dtype=np.float32)
+
+X0, y0, rms0 = load_class(os.path.join(DATASET_DIR, "0"), label=0)
+X1, y1, rms1 = load_class(os.path.join(DATASET_DIR, "1"), label=1)
+
+print(f"\nEkstraksi selesai:")
+print(f"  Kelas 0 (Snoring Normal): {len(X0)} sampel | shape={X0.shape}")
+print(f"  Kelas 1 (Apnea)         : {len(X1)} sampel | shape={X1.shape}")
+
+if len(X0) == 0 or len(X1) == 0:
+    print("ERROR: Tidak ada sampel! Cek path atau file audio.")
+    sys.exit(1)
+
+X       = np.vstack([X0, X1])
+y       = np.concatenate([y0, y1])
+all_rms = np.concatenate([rms0, rms1])
+
+print(f"\nTotal gabungan: {len(X)} sampel, {X.shape[1]} fitur")
+print(f"  RMS Normal  | mean={np.mean(rms0):.6f} | std={np.std(rms0):.6f}")
+print(f"  RMS Apnea   | mean={np.mean(rms1):.6f} | std={np.std(rms1):.6f}")
+
+# ─────────────────────────────────────────────
+# 3. ANALISIS POLA TEMPORAL APNEA
+# ─────────────────────────────────────────────
+section("ANALISIS POLA TEMPORAL APNEA")
+print("  Pola Apnea: NGOROK -> HENING (>=10 detik) -> NGOROK LAGI")
+
+# Threshold RMS adaptif (percentile 20 dari semua data)
+rms_threshold = float(np.percentile(all_rms, 20))
+print(f"\n  Threshold RMS (adaptive p20): {rms_threshold:.6f}")
+
+def get_segment_types(rms_array, threshold):
+    return ['snoring' if r > threshold else 'silence' for r in rms_array]
+
+def find_apnea_events(seg_types, min_silence_sec=APNEA_SILENCE_THRESHOLD):
+    """Cari: snoring -> silence (>=min_silence_sec frame) -> snoring"""
+    events = []
+    n = len(seg_types)
+    i = 0
+    while i < n:
+        if seg_types[i] == 'snoring':
+            # Skip snoring run
+            j = i
+            while j < n and seg_types[j] == 'snoring':
+                j += 1
+            # Check silence run
+            if j < n and seg_types[j] == 'silence':
+                sil_start = j
+                while j < n and seg_types[j] == 'silence':
+                    j += 1
+                sil_end = j
+                sil_dur = sil_end - sil_start
+                # Check snoring resumes after silence
+                if sil_dur >= min_silence_sec and j < n and seg_types[j] == 'snoring':
+                    events.append({
+                        'snore_start': i, 'silence_start': sil_start,
+                        'silence_end': sil_end, 'silence_dur': sil_dur,
+                        'snore_resume': j
+                    })
+            i = j if j > i else i + 1
+        else:
+            i += 1
+    return events
+
+def analyze_pattern(rms_vals, label_name, max_analyze=200):
+    rms_sub = rms_vals[:max_analyze]
+    segs    = get_segment_types(rms_sub, rms_threshold)
+    events  = find_apnea_events(segs)
+    counts  = Counter(segs)
+    total   = len(segs)
+    print(f"\n  [{label_name}] - Analisis {total} detik:")
+    print(f"    NGOROK : {counts.get('snoring',0):4d} seg ({counts.get('snoring',0)/total*100:.1f}%)")
+    print(f"    HENING : {counts.get('silence',0):4d} seg ({counts.get('silence',0)/total*100:.1f}%)")
+    print(f"    Event Apnea (hening >={APNEA_SILENCE_THRESHOLD}s) terdeteksi: {len(events)}")
+    for ev in events[:5]:
+        print(f"      -> Det.{ev['snore_start']+1} ngorok | "
+              f"Hening {ev['silence_dur']}s (det.{ev['silence_start']+1}-{ev['silence_end']}) | "
+              f"Ngorok lagi det.{ev['snore_resume']+1}")
+    return segs, events
+
+seg_normal, ev_normal = analyze_pattern(rms0, "SNORING NORMAL")
+seg_apnea,  ev_apnea  = analyze_pattern(rms1, "APNEA")
+
+# ─────────────────────────────────────────────
+# 4. VISUALISASI POLA TEMPORAL
+# ─────────────────────────────────────────────
+section("VISUALISASI POLA TEMPORAL")
+
+DARK_BG  = '#0d1117'
+CARD_BG  = '#161b22'
+TEXT_COL = '#e6edf3'
+GRID_COL = '#30363d'
+
+n_show = min(100, len(rms0), len(rms1))
+
+fig, axes = plt.subplots(2, 1, figsize=(16, 7))
+fig.patch.set_facecolor(DARK_BG)
+
+datasets = [
+    (rms0, seg_normal, ev_normal, "Snoring Normal - Pola Berkelanjutan",   '#4fc3f7', '#1565c0'),
+    (rms1, seg_apnea,  ev_apnea,  "Apnea - Pola Ngorok -> Hening -> Ngorok", '#ef5350', '#4a148c'),
+]
+
+for ax, (rms_v, segs, evs, title, c_snore, c_sil) in zip(axes, datasets):
+    ax.set_facecolor(DARK_BG)
+    sub_rms  = rms_v[:n_show]
+    sub_segs = segs[:n_show]
+    bar_colors = [c_snore if s == 'snoring' else c_sil for s in sub_segs]
+    ax.bar(range(len(sub_segs)), [1]*len(sub_segs), color=bar_colors, width=1.0, lw=0)
+
+    # RMS overlay
+    ax2 = ax.twinx()
+    ax2.set_facecolor('none')
+    ax2.plot(range(len(sub_rms)), sub_rms, color='yellow', alpha=0.6, lw=1.5)
+    ax2.axhline(rms_threshold, color='orange', ls='--', lw=1.5, alpha=0.9)
+    ax2.set_ylabel("RMS", color='yellow', fontsize=9)
+    ax2.tick_params(axis='y', labelcolor='yellow', labelsize=8)
+
+    ax.set_xlim(0, n_show); ax.set_ylim(0, 1.25)
+    ax.set_xlabel("Waktu (detik)", color=TEXT_COL, fontsize=11)
+    ax.set_title(title, color=TEXT_COL, fontsize=13, fontweight='bold')
+    ax.set_yticks([])
+    ax.tick_params(colors=TEXT_COL)
+
+    from matplotlib.patches import Patch
+    ax.legend(handles=[
+        Patch(color=c_snore, label='NGOROK'),
+        Patch(color=c_sil,   label='HENING'),
+        Patch(color='yellow', alpha=0.6, label='RMS Energy'),
+        Patch(color='orange', alpha=0.9, label=f'Threshold={rms_threshold:.5f}'),
+    ], loc='upper left', framealpha=0.25, labelcolor='white', fontsize=9)
+
+    # Highlight apnea events
+    for ev in evs:
+        ss, se = ev['silence_start'], min(ev['silence_end'], n_show)
+        if ss < n_show:
+            ax.axvspan(ss, se, alpha=0.35, color='yellow', zorder=3)
+            ax.text((ss+se)/2, 1.12, f"Apnea\n{ev['silence_dur']}s",
+                    ha='center', color='yellow', fontsize=8, fontweight='bold')
+
+plt.suptitle("Pola Temporal: Snoring Normal vs Apnea (100 detik pertama)",
+             color='white', fontsize=14, fontweight='bold')
+plt.tight_layout()
+plt.savefig(os.path.join(OUTPUT_DIR, "01_pola_temporal.png"),
+            dpi=150, bbox_inches='tight', facecolor=DARK_BG)
+plt.close()
+print("  Simpan: 01_pola_temporal.png")
+
+# ─────────────────────────────────────────────
+# 5. PRAPEMROSESAN
+# ─────────────────────────────────────────────
+section("PRAPEMROSESAN DATA")
+
+X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=42, stratify=y
+)
+
+scaler     = StandardScaler()
+X_train_s  = scaler.fit_transform(X_train)
+X_test_s   = scaler.transform(X_test)
+
+print(f"  Training : {X_train.shape[0]} sampel")
+print(f"  Testing  : {X_test.shape[0]} sampel")
+print(f"  Train kelas - Normal:{np.sum(y_train==0)}, Apnea:{np.sum(y_train==1)}")
+print(f"  Test kelas  - Normal:{np.sum(y_test==0)},  Apnea:{np.sum(y_test==1)}")
+
+# ─────────────────────────────────────────────
+# 6. DEFINISI MODEL
+# ─────────────────────────────────────────────
+models = {
+    "SVM (RBF)":           SVC(kernel='rbf', C=10, gamma='scale',
+                               probability=True, random_state=42),
+    "Random Forest":        RandomForestClassifier(n_estimators=200, max_depth=15,
+                               min_samples_split=5, random_state=42, n_jobs=-1),
+    "Gradient Boosting":    GradientBoostingClassifier(n_estimators=150,
+                               learning_rate=0.1, max_depth=5, random_state=42),
+    "K-Nearest Neighbors":  KNeighborsClassifier(n_neighbors=7, n_jobs=-1),
+    "Logistic Regression":  LogisticRegression(C=1.0, max_iter=1000,
+                               random_state=42, n_jobs=-1),
+}
+
+# ─────────────────────────────────────────────
+# 7. TRAINING & EVALUASI
+# ─────────────────────────────────────────────
+section("TRAINING & EVALUASI MODEL")
+
+results = {}
+cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+
+for name, model in models.items():
+    print(f"\n  >> {name}")
+    t0 = time.time()
+    model.fit(X_train_s, y_train)
+    y_pred = model.predict(X_test_s)
+
+    if hasattr(model, 'predict_proba'):
+        y_prob = model.predict_proba(X_test_s)[:, 1]
+    else:
+        df = model.decision_function(X_test_s)
+        y_prob = (df - df.min()) / (df.max() - df.min() + 1e-10)
+
+    cv_scores = cross_val_score(model, X_train_s, y_train,
+                                cv=cv, scoring='f1', n_jobs=-1)
+    dt = time.time() - t0
+
+    acc  = accuracy_score(y_test, y_pred)
+    prec = precision_score(y_test, y_pred, zero_division=0)
+    rec  = recall_score(y_test, y_pred, zero_division=0)
+    f1   = f1_score(y_test, y_pred, zero_division=0)
+    roc  = roc_auc_score(y_test, y_prob)
+    cm   = confusion_matrix(y_test, y_pred)
+    tn, fp, fn, tp = cm.ravel()
+    spec = tn / (tn + fp + 1e-10)
+    npv  = tn / (tn + fn + 1e-10)
+
+    results[name] = dict(
+        model=model, y_pred=y_pred, y_prob=y_prob,
+        accuracy=acc, precision=prec, recall=rec,
+        f1=f1, roc_auc=roc, cv_f1=cv_scores,
+        cm=cm, tn=int(tn), fp=int(fp), fn=int(fn), tp=int(tp),
+        specificity=spec, npv=npv, time=dt
+    )
+
+    print(f"    Accuracy    : {acc:.4f}  ({acc*100:.2f}%)")
+    print(f"    Precision   : {prec:.4f}")
+    print(f"    Recall      : {rec:.4f}")
+    print(f"    F1-Score    : {f1:.4f}")
+    print(f"    ROC-AUC     : {roc:.4f}")
+    print(f"    Specificity : {spec:.4f}")
+    print(f"    CV F1 (5K)  : {cv_scores.mean():.4f} +/- {cv_scores.std():.4f}")
+    print(f"    Waktu       : {dt:.2f}s")
+    print(f"    TP={tp}  TN={tn}  FP={fp}  FN={fn}")
+
+# ─────────────────────────────────────────────
+# 8. RINGKASAN PERBANDINGAN
+# ─────────────────────────────────────────────
+section("RINGKASAN PERBANDINGAN MODEL")
+
+best_name = max(results, key=lambda k: results[k]['f1'])
+print(f"\n  {'Model':<28} {'Acc':>8} {'Prec':>8} {'Rec':>8} {'F1':>8} {'AUC':>8} {'Spec':>8}")
+print("  " + "-"*78)
+for name, r in results.items():
+    mark = "  <-- TERBAIK" if name == best_name else ""
+    print(f"  {name:<28} {r['accuracy']:>8.4f} {r['precision']:>8.4f} "
+          f"{r['recall']:>8.4f} {r['f1']:>8.4f} {r['roc_auc']:>8.4f} "
+          f"{r['specificity']:>8.4f}{mark}")
+
+best_r = results[best_name]
+
+section(f"CLASSIFICATION REPORT - {best_name}")
+print(classification_report(y_test, best_r['y_pred'],
+      target_names=['Snoring Normal', 'Apnea'], digits=4))
+
+# ─────────────────────────────────────────────
+# 9. VISUALISASI HASIL
+# ─────────────────────────────────────────────
+section("MEMBUAT VISUALISASI HASIL")
+
+plt.rcParams.update({
+    'figure.facecolor': DARK_BG, 'axes.facecolor': CARD_BG,
+    'axes.edgecolor': GRID_COL, 'axes.labelcolor': TEXT_COL,
+    'xtick.color': TEXT_COL, 'ytick.color': TEXT_COL,
+    'text.color': TEXT_COL, 'grid.color': GRID_COL,
+})
+
+PAL = ['#58a6ff', '#ff9800', '#3fb950', '#ba68c8', '#ef5350']
+
+# ── 9a. Confusion Matrices ──
+nmod  = len(results)
+ncols = 3
+nrows = (nmod + ncols - 1) // ncols
+fig, axes = plt.subplots(nrows, ncols, figsize=(18, nrows * 5.5))
+fig.patch.set_facecolor(DARK_BG)
+axf = axes.flatten() if hasattr(axes, 'flatten') else [axes]
+
+for idx, (name, r) in enumerate(results.items()):
+    ax = axf[idx]
+    sns.heatmap(r['cm'], annot=True, fmt='d', cmap='Blues',
+                xticklabels=['Snoring\nNormal', 'Apnea'],
+                yticklabels=['Snoring\nNormal', 'Apnea'],
+                ax=ax, lw=1, linecolor=GRID_COL,
+                annot_kws={'size': 16, 'weight': 'bold'})
+    ax.set_facecolor(CARD_BG)
+    ax.set_title(f"{name}\nAcc={r['accuracy']:.3f} | F1={r['f1']:.3f} | AUC={r['roc_auc']:.3f}",
+                 color=TEXT_COL, fontsize=10, fontweight='bold')
+    ax.set_xlabel("Prediksi", color=TEXT_COL)
+    ax.set_ylabel("Aktual",   color=TEXT_COL)
+
+for idx in range(nmod, len(axf)):
+    axf[idx].set_visible(False)
+
+plt.suptitle("Confusion Matrix Semua Model - Deteksi Apnea vs Snoring Normal",
+             color='white', fontsize=14, fontweight='bold')
+plt.tight_layout()
+plt.savefig(os.path.join(OUTPUT_DIR, "02_confusion_matrices.png"),
+            dpi=150, bbox_inches='tight', facecolor=DARK_BG)
+plt.close()
+print("  Simpan: 02_confusion_matrices.png")
+
+# ── 9b. ROC Curves ──
+fig, ax = plt.subplots(figsize=(10, 8))
+fig.patch.set_facecolor(DARK_BG)
+ax.set_facecolor(CARD_BG)
+ax.plot([0,1],[0,1],'w--', alpha=0.4, lw=1.5, label='Random (AUC=0.50)')
+
+for (name, r), col in zip(results.items(), PAL):
+    fpr, tpr, _ = roc_curve(y_test, r['y_prob'])
+    ax.plot(fpr, tpr, color=col, lw=2.5,
+            label=f"{name} (AUC={r['roc_auc']:.4f})")
+    ax.fill_between(fpr, tpr, alpha=0.06, color=col)
+
+ax.set_xlabel("False Positive Rate", fontsize=13)
+ax.set_ylabel("True Positive Rate",  fontsize=13)
+ax.set_title("Kurva ROC - Deteksi Apnea vs Snoring Normal",
+             fontsize=14, fontweight='bold')
+ax.legend(loc='lower right', fontsize=10, framealpha=0.3)
+ax.grid(True, alpha=0.3)
+ax.set_xlim([0,1]); ax.set_ylim([0,1.05])
+plt.tight_layout()
+plt.savefig(os.path.join(OUTPUT_DIR, "03_roc_curves.png"),
+            dpi=150, bbox_inches='tight', facecolor=DARK_BG)
+plt.close()
+print("  Simpan: 03_roc_curves.png")
+
+# ── 9c. Bar Chart Perbandingan Metrik ──
+model_list = list(results.keys())
+abbrevs    = ['SVM', 'RF', 'GBM', 'KNN', 'LR']
+metrics_to_plot = {
+    'Accuracy':    [results[m]['accuracy']    for m in model_list],
+    'Precision':   [results[m]['precision']   for m in model_list],
+    'Recall':      [results[m]['recall']      for m in model_list],
+    'F1-Score':    [results[m]['f1']          for m in model_list],
+    'ROC-AUC':     [results[m]['roc_auc']     for m in model_list],
+}
+
+fig, axes = plt.subplots(1, 5, figsize=(22, 6))
+fig.patch.set_facecolor(DARK_BG)
+
+for idx, (metric, vals) in enumerate(metrics_to_plot.items()):
+    ax = axes[idx]
+    ax.set_facecolor(CARD_BG)
+    bars = ax.bar(abbrevs, vals, color=[c + 'cc' for c in PAL],
+                  edgecolor='white', lw=0.5)
+    ax.set_title(metric, color='white', fontsize=13, fontweight='bold')
+    lo = max(0.3, min(vals) - 0.1)
+    ax.set_ylim(lo, 1.06)
+    ax.grid(axis='y', alpha=0.3)
+    ax.tick_params(axis='x', rotation=15, labelsize=10)
+
+    best_i = int(np.argmax(vals))
+    bars[best_i].set_edgecolor('gold')
+    bars[best_i].set_linewidth(3)
+
+    for b, v in zip(bars, vals):
+        ax.text(b.get_x() + b.get_width()/2, b.get_height() + 0.003,
+                f'{v:.3f}', ha='center', va='bottom',
+                color='white', fontsize=9, fontweight='bold')
+
+plt.suptitle("Perbandingan Metrik Klasifikasi - Apnea vs Snoring Normal",
+             color='white', fontsize=14, fontweight='bold')
+plt.tight_layout()
+plt.savefig(os.path.join(OUTPUT_DIR, "04_perbandingan_metrik.png"),
+            dpi=150, bbox_inches='tight', facecolor=DARK_BG)
+plt.close()
+print("  Simpan: 04_perbandingan_metrik.png")
+
+# ── 9d. Feature Importance (Random Forest) ──
+rf_model    = results['Random Forest']['model']
+importances = rf_model.feature_importances_
+
+n_feat = X.shape[1]
+feat_names = (
+    [f'MFCC_mean_{i+1}' for i in range(N_MFCC)] +
+    [f'MFCC_std_{i+1}'  for i in range(N_MFCC)] +
+    [f'MFCC_delta_{i+1}' for i in range(N_MFCC)] +
+    ['RMS_Energy', 'ZCR', 'Spec_Centroid', 'Spec_Rolloff', 'Spec_BW']
+)
+feat_names = feat_names[:n_feat]
+
+top20_idx  = np.argsort(importances)[::-1][:20]
+top_names  = [feat_names[i] for i in top20_idx]
+top_vals   = importances[top20_idx]
+
+fig, ax = plt.subplots(figsize=(12, 8))
+fig.patch.set_facecolor(DARK_BG)
+ax.set_facecolor(CARD_BG)
+cmap_fi  = plt.cm.Blues
+norm_v   = (top_vals - top_vals.min()) / (top_vals.max() - top_vals.min() + 1e-10)
+colors_fi = [cmap_fi(0.4 + 0.6 * v) for v in norm_v]
+ax.barh(range(20), top_vals[::-1], color=colors_fi[::-1], edgecolor='white', lw=0.3)
+ax.set_yticks(range(20))
+ax.set_yticklabels(top_names[::-1], fontsize=10)
+ax.set_xlabel("Feature Importance", fontsize=12)
+ax.set_title("Top 20 Fitur Paling Penting (Random Forest)",
+             color='white', fontsize=13, fontweight='bold')
+ax.grid(axis='x', alpha=0.3)
+plt.tight_layout()
+plt.savefig(os.path.join(OUTPUT_DIR, "05_feature_importance.png"),
+            dpi=150, bbox_inches='tight', facecolor=DARK_BG)
+plt.close()
+print("  Simpan: 05_feature_importance.png")
+
+# ── 9e. CV Score Comparison ──
+cv_means = [results[m]['cv_f1'].mean() for m in model_list]
+cv_stds  = [results[m]['cv_f1'].std()  for m in model_list]
+
+fig, ax = plt.subplots(figsize=(12, 6))
+fig.patch.set_facecolor(DARK_BG)
+ax.set_facecolor(CARD_BG)
+x_pos = np.arange(len(model_list))
+ax.bar(x_pos, cv_means, yerr=cv_stds, capsize=8,
+       color=[c + 'bb' for c in PAL], edgecolor='white', lw=0.5,
+       error_kw={'color':'white','lw':2})
+ax.set_xticks(x_pos)
+ax.set_xticklabels([m.replace(' ','\n') for m in model_list], fontsize=10)
+ax.set_ylabel("F1-Score (CV 5-Fold)", fontsize=12)
+ax.set_title("Cross-Validation F1 (5-Fold) - Semua Model",
+             fontsize=14, fontweight='bold')
+ax.set_ylim(max(0.3, min(cv_means) - 0.15), 1.06)
+ax.grid(axis='y', alpha=0.3)
+for xi, (m, s) in enumerate(zip(cv_means, cv_stds)):
+    ax.text(xi, m + s + 0.01, f'{m:.4f}\n+/-{s:.4f}',
+            ha='center', va='bottom', color='white', fontsize=9, fontweight='bold')
+plt.tight_layout()
+plt.savefig(os.path.join(OUTPUT_DIR, "06_cv_scores.png"),
+            dpi=150, bbox_inches='tight', facecolor=DARK_BG)
+plt.close()
+print("  Simpan: 06_cv_scores.png")
+
+# ── 9f. Distribusi RMS ──
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+fig.patch.set_facecolor(DARK_BG)
+for ax in axes:
+    ax.set_facecolor(CARD_BG)
+
+axes[0].hist(rms0, bins=60, color='#4fc3f7', alpha=0.7, label='Snoring Normal', density=True)
+axes[0].hist(rms1, bins=60, color='#ef5350', alpha=0.7, label='Apnea', density=True)
+axes[0].axvline(rms_threshold, color='yellow', ls='--', lw=2, label=f'Threshold={rms_threshold:.5f}')
+axes[0].set_xlabel("RMS Energy", fontsize=12)
+axes[0].set_ylabel("Densitas", fontsize=12)
+axes[0].set_title("Distribusi RMS Energy\nSnoring Normal vs Apnea",
+                  fontsize=13, fontweight='bold')
+axes[0].legend(fontsize=10, framealpha=0.3, labelcolor='white')
+axes[0].grid(alpha=0.3)
+
+bp = axes[1].boxplot([rms0, rms1], labels=['Snoring\nNormal', 'Apnea'],
+                     patch_artist=True,
+                     boxprops=dict(facecolor='#4fc3f780', color='white'),
+                     medianprops=dict(color='yellow', lw=2),
+                     whiskerprops=dict(color='white'),
+                     capprops=dict(color='white'),
+                     flierprops=dict(marker='o', color='red', alpha=0.3, ms=3))
+axes[1].set_ylabel("RMS Energy", fontsize=12)
+axes[1].set_title("Boxplot RMS Energy\nSnoring Normal vs Apnea",
+                  fontsize=13, fontweight='bold')
+axes[1].grid(axis='y', alpha=0.3)
+
+plt.tight_layout()
+plt.savefig(os.path.join(OUTPUT_DIR, "07_distribusi_rms.png"),
+            dpi=150, bbox_inches='tight', facecolor=DARK_BG)
+plt.close()
+print("  Simpan: 07_distribusi_rms.png")
+
+# ── 9g. Dashboard Ringkasan (Model Terbaik) ──
+fig = plt.figure(figsize=(18, 10))
+fig.patch.set_facecolor(DARK_BG)
+gs = fig.add_gridspec(2, 3, hspace=0.4, wspace=0.35)
+
+# Panel 1: Confusion Matrix best model
+ax_cm = fig.add_subplot(gs[0, 0])
+ax_cm.set_facecolor(CARD_BG)
+sns.heatmap(best_r['cm'], annot=True, fmt='d', cmap='Blues',
+            xticklabels=['Snoring\nNormal', 'Apnea'],
+            yticklabels=['Snoring\nNormal', 'Apnea'],
+            ax=ax_cm, lw=1, linecolor=GRID_COL,
+            annot_kws={'size': 18, 'weight': 'bold'})
+ax_cm.set_title(f"Confusion Matrix\n{best_name}", color=TEXT_COL, fontsize=11, fontweight='bold')
+ax_cm.set_xlabel("Prediksi", color=TEXT_COL); ax_cm.set_ylabel("Aktual", color=TEXT_COL)
+
+# Panel 2: ROC curve best model
+ax_roc = fig.add_subplot(gs[0, 1])
+ax_roc.set_facecolor(CARD_BG)
+fpr_b, tpr_b, _ = roc_curve(y_test, best_r['y_prob'])
+ax_roc.plot(fpr_b, tpr_b, color='#58a6ff', lw=2.5,
+            label=f"AUC={best_r['roc_auc']:.4f}")
+ax_roc.fill_between(fpr_b, tpr_b, alpha=0.15, color='#58a6ff')
+ax_roc.plot([0,1],[0,1],'w--', alpha=0.4, lw=1)
+ax_roc.set_xlabel("FPR", fontsize=11); ax_roc.set_ylabel("TPR", fontsize=11)
+ax_roc.set_title(f"Kurva ROC\n{best_name}", fontsize=11, fontweight='bold')
+ax_roc.legend(fontsize=11, framealpha=0.3)
+ax_roc.grid(alpha=0.3)
+
+# Panel 3: Metric summary cards
+ax_m = fig.add_subplot(gs[0, 2])
+ax_m.set_facecolor(CARD_BG)
+ax_m.set_xlim(0, 1); ax_m.set_ylim(0, 1); ax_m.axis('off')
+metrics_display = [
+    ("Accuracy",    f"{best_r['accuracy']*100:.2f}%",    '#58a6ff'),
+    ("Precision",   f"{best_r['precision']*100:.2f}%",   '#3fb950'),
+    ("Recall",      f"{best_r['recall']*100:.2f}%",      '#ff9800'),
+    ("F1-Score",    f"{best_r['f1']*100:.2f}%",          '#ba68c8'),
+    ("ROC-AUC",     f"{best_r['roc_auc']:.4f}",          '#ef5350'),
+    ("Specificity", f"{best_r['specificity']*100:.2f}%", '#4fc3f7'),
+]
+ax_m.set_title(f"Metrik - {best_name}", color=TEXT_COL, fontsize=11, fontweight='bold')
+for i, (label, val, color) in enumerate(metrics_display):
+    y_pos = 0.85 - i * 0.14
+    ax_m.text(0.05, y_pos, label + ":", color='white', fontsize=11, va='center')
+    ax_m.text(0.95, y_pos, val, color=color, fontsize=14, fontweight='bold',
+              va='center', ha='right')
+
+# Panel 4: Bar chart semua model - F1
+ax_f1 = fig.add_subplot(gs[1, 0])
+ax_f1.set_facecolor(CARD_BG)
+f1_vals  = [results[m]['f1'] for m in model_list]
+bars_f1  = ax_f1.bar(abbrevs, f1_vals, color=[c+'cc' for c in PAL],
+                     edgecolor='white', lw=0.5)
+best_f1_i = int(np.argmax(f1_vals))
+bars_f1[best_f1_i].set_edgecolor('gold'); bars_f1[best_f1_i].set_lw(3)
+ax_f1.set_ylim(max(0.3, min(f1_vals)-0.05), 1.06)
+ax_f1.set_title("F1-Score per Model", fontsize=11, fontweight='bold')
+ax_f1.set_ylabel("F1-Score"); ax_f1.grid(axis='y', alpha=0.3)
+for b, v in zip(bars_f1, f1_vals):
+    ax_f1.text(b.get_x()+b.get_width()/2, b.get_height()+0.003,
+               f'{v:.3f}', ha='center', va='bottom', color='white', fontsize=9, fontweight='bold')
+
+# Panel 5: Bar chart AUC
+ax_auc = fig.add_subplot(gs[1, 1])
+ax_auc.set_facecolor(CARD_BG)
+auc_vals = [results[m]['roc_auc'] for m in model_list]
+bars_auc = ax_auc.bar(abbrevs, auc_vals, color=[c+'cc' for c in PAL],
+                      edgecolor='white', lw=0.5)
+best_auc_i = int(np.argmax(auc_vals))
+bars_auc[best_auc_i].set_edgecolor('gold'); bars_auc[best_auc_i].set_lw(3)
+ax_auc.set_ylim(max(0.3, min(auc_vals)-0.05), 1.06)
+ax_auc.set_title("ROC-AUC per Model", fontsize=11, fontweight='bold')
+ax_auc.set_ylabel("AUC"); ax_auc.grid(axis='y', alpha=0.3)
+for b, v in zip(bars_auc, auc_vals):
+    ax_auc.text(b.get_x()+b.get_width()/2, b.get_height()+0.003,
+               f'{v:.3f}', ha='center', va='bottom', color='white', fontsize=9, fontweight='bold')
+
+# Panel 6: CV F1
+ax_cv = fig.add_subplot(gs[1, 2])
+ax_cv.set_facecolor(CARD_BG)
+x_cv = np.arange(len(model_list))
+ax_cv.bar(x_cv, cv_means, yerr=cv_stds, capsize=6,
+          color=[c+'bb' for c in PAL], edgecolor='white', lw=0.5,
+          error_kw={'color':'white','lw':2})
+ax_cv.set_xticks(x_cv)
+ax_cv.set_xticklabels(abbrevs, fontsize=10)
+ax_cv.set_title("CV F1 (5-Fold)", fontsize=11, fontweight='bold')
+ax_cv.set_ylabel("F1-Score"); ax_cv.grid(axis='y', alpha=0.3)
+ax_cv.set_ylim(max(0.3, min(cv_means)-0.15), 1.06)
+
+plt.suptitle(f"Dashboard Hasil ML - Deteksi Apnea vs Snoring Normal\n"
+             f"Dataset: {len(X)} sampel | Fitur: {X.shape[1]} | Best Model: {best_name}",
+             color='white', fontsize=14, fontweight='bold')
+
+plt.savefig(os.path.join(OUTPUT_DIR, "08_dashboard_ringkasan.png"),
+            dpi=150, bbox_inches='tight', facecolor=DARK_BG)
+plt.close()
+print("  Simpan: 08_dashboard_ringkasan.png")
+
+# ─────────────────────────────────────────────
+# 10. SIMPAN LAPORAN TEKS
+# ─────────────────────────────────────────────
+section("MENYIMPAN LAPORAN LENGKAP")
+
+rep_path = os.path.join(OUTPUT_DIR, "laporan_hasil_ml.txt")
+with open(rep_path, 'w', encoding='utf-8') as f:
+    f.write("=" * 70 + "\n")
+    f.write("   LAPORAN HASIL KLASIFIKASI: APNEA vs SNORING NORMAL\n")
+    f.write("   Tugas Akhir - Deteksi Sleep Apnea dari Rekaman Suara\n")
+    f.write("=" * 70 + "\n\n")
+    f.write(f"Tanggal : {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+    f.write(f"Dataset : {DATASET_DIR}\n")
+    f.write(f"SR      : {SR} Hz | Durasi/segmen: 1 detik\n")
+    f.write(f"Total   : {len(X)} sampel\n")
+    f.write(f"  - Kelas 0 (Snoring Normal): {int(np.sum(y==0))}\n")
+    f.write(f"  - Kelas 1 (Apnea)         : {int(np.sum(y==1))}\n")
+    f.write(f"Fitur   : {X.shape[1]} dimensi (MFCC+delta, RMS, ZCR, Spectral)\n")
+    f.write(f"Split   : 80% Train / 20% Test (stratified)\n\n")
+
+    f.write("-" * 70 + "\n")
+    f.write("DEFINISI APNEA (POLA TEMPORAL)\n")
+    f.write("-" * 70 + "\n")
+    f.write(f"  Pola  : NGOROK -> HENING (>= {APNEA_SILENCE_THRESHOLD} detik) -> NGOROK LAGI\n")
+    f.write(f"  RMS threshold (adaptive p20): {rms_threshold:.6f}\n")
+    cn = Counter(seg_normal[:200])
+    ca = Counter(seg_apnea[:200])
+    f.write(f"  Snoring Normal (200 det): {cn.get('snoring',0)} ngorok, "
+            f"{cn.get('silence',0)} hening\n")
+    f.write(f"  Apnea (200 det)         : {ca.get('snoring',0)} ngorok, "
+            f"{ca.get('silence',0)} hening\n")
+    f.write(f"  Event Apnea terdeteksi  : {len(ev_apnea)}\n\n")
+
+    f.write("-" * 70 + "\n")
+    f.write("PERBANDINGAN SEMUA MODEL\n")
+    f.write("-" * 70 + "\n")
+    f.write(f"  {'Model':<28} {'Acc':>8} {'Prec':>8} {'Rec':>8} {'F1':>8} "
+            f"{'AUC':>8} {'Spec':>8}\n")
+    f.write("  " + "-" * 68 + "\n")
+    for name, r in results.items():
+        mark = "  <-- TERBAIK" if name == best_name else ""
+        f.write(f"  {name:<28} {r['accuracy']:>8.4f} {r['precision']:>8.4f} "
+                f"{r['recall']:>8.4f} {r['f1']:>8.4f} {r['roc_auc']:>8.4f} "
+                f"{r['specificity']:>8.4f}{mark}\n")
+    f.write("\n")
+
+    f.write("-" * 70 + "\n")
+    f.write(f"MODEL TERBAIK: {best_name}\n")
+    f.write("-" * 70 + "\n")
+    f.write(classification_report(y_test, best_r['y_pred'],
+            target_names=['Snoring Normal', 'Apnea'], digits=4))
+    f.write("\n")
+
+    tn = best_r['tn']; fp_v = best_r['fp']
+    fn = best_r['fn']; tp_v = best_r['tp']
+    sens = tp_v / (tp_v + fn + 1e-10)
+    spec = best_r['specificity']
+    ppv  = tp_v / (tp_v + fp_v + 1e-10)
+    npv  = tn / (tn + fn + 1e-10)
+
+    f.write("CONFUSION MATRIX:\n")
+    f.write(f"  TP (Apnea benar terdeteksi)     : {tp_v}\n")
+    f.write(f"  TN (Snoring benar terdeteksi)   : {tn}\n")
+    f.write(f"  FP (Snoring salah sbg Apnea)    : {fp_v}\n")
+    f.write(f"  FN (Apnea tidak terdeteksi)     : {fn}\n\n")
+    f.write("METRIK KLINIS:\n")
+    f.write(f"  Sensitivity / Recall (TPR) : {sens:.4f} ({sens*100:.2f}%)\n")
+    f.write(f"  Specificity (TNR)          : {spec:.4f} ({spec*100:.2f}%)\n")
+    f.write(f"  Precision / PPV            : {ppv:.4f} ({ppv*100:.2f}%)\n")
+    f.write(f"  Negative Predictive Value  : {npv:.4f} ({npv*100:.2f}%)\n")
+    f.write(f"  F1-Score                   : {best_r['f1']:.4f}\n")
+    f.write(f"  ROC-AUC                    : {best_r['roc_auc']:.4f}\n")
+    f.write(f"  Accuracy                   : {best_r['accuracy']:.4f} "
+            f"({best_r['accuracy']*100:.2f}%)\n")
+
+print(f"  Laporan disimpan: {rep_path}")
+
+# ─────────────────────────────────────────────
+# 11. RINGKASAN AKHIR DI TERMINAL
+# ─────────────────────────────────────────────
+section("SELESAI - RINGKASAN AKHIR")
+
+print(f"\n  Total Sampel : {len(X)} (Normal={int(np.sum(y==0))}, Apnea={int(np.sum(y==1))})")
+print(f"  Jumlah Fitur : {X.shape[1]}")
+print(f"  Pola Apnea   : Ngorok -> Hening >= {APNEA_SILENCE_THRESHOLD}s -> Ngorok lagi")
+print(f"  Event Apnea  : {len(ev_apnea)} terdeteksi dalam 200 detik folder apnea")
+
+print(f"\n  *** Model Terbaik (F1): {best_name} ***")
+print(f"    Accuracy     : {best_r['accuracy']:.4f}  ({best_r['accuracy']*100:.2f}%)")
+print(f"    Precision    : {best_r['precision']:.4f}  ({best_r['precision']*100:.2f}%)")
+print(f"    Recall       : {best_r['recall']:.4f}  ({best_r['recall']*100:.2f}%)")
+print(f"    F1-Score     : {best_r['f1']:.4f}  ({best_r['f1']*100:.2f}%)")
+print(f"    ROC-AUC      : {best_r['roc_auc']:.4f}")
+print(f"    Specificity  : {best_r['specificity']:.4f}  ({best_r['specificity']*100:.2f}%)")
+print(f"    CV F1 (5K)   : {best_r['cv_f1'].mean():.4f} +/- {best_r['cv_f1'].std():.4f}")
+
+print(f"\n  Output di: {OUTPUT_DIR}")
+for fn_out in ['01_pola_temporal.png','02_confusion_matrices.png',
+               '03_roc_curves.png','04_perbandingan_metrik.png',
+               '05_feature_importance.png','06_cv_scores.png',
+               '07_distribusi_rms.png','08_dashboard_ringkasan.png',
+               'laporan_hasil_ml.txt']:
+    fp_chk = os.path.join(OUTPUT_DIR, fn_out)
+    status = "OK" if os.path.exists(fp_chk) else "MISSING"
+    print(f"    [{status}] {fn_out}")
+print()
